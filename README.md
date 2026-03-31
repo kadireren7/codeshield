@@ -1,6 +1,6 @@
 # CodeShield AI
 
-Minimal FastAPI backend for code-analysis request intake.
+Minimal FastAPI backend with a local rule-based project path analyzer.
 
 ## Why this exists
 
@@ -12,22 +12,23 @@ The goal is to build a real code-analysis backend in public, one verifiable step
 ## What it does today
 
 - Accepts analysis intake requests via `POST /api/v1/analyze`
-- Validates payload shape and supported language values
-- Returns a generated `request_id` with `pending` status
+- Supports local project scanning via `POST /api/v1/analyze/path`
+- Scans local source files and returns likely production risk findings
 - Exposes health and API metadata endpoints:
   - `GET /healthz`
   - `GET /api/v1/meta`
 
-## What's planned (not implemented yet)
+## Local-only warning (important)
 
-- Result retrieval endpoint (`GET /api/v1/analysis/{request_id}`)
-- Persistence for request lifecycle
-- Real analysis execution behind intake
-- Basic auth and rate limiting
+`POST /api/v1/analyze/path` is for **local developer use only**.
+
+- It reads filesystem paths on the same machine where this API runs.
+- It is **not safe for public internet exposure**.
+- Do not deploy this endpoint publicly without strict access controls and sandboxing.
 
 ## Demo
 
-This MVP currently supports request intake only.
+This MVP supports intake and local path analysis.
 
 ### 1) Submit code for analysis
 
@@ -47,10 +48,43 @@ curl -X POST "http://localhost:8000/api/v1/analyze" \
 }
 ```
 
-### 3) Next step (not implemented yet)
+### 3) Analyze a local project path
 
-The next planned endpoint is `GET /api/v1/analysis/{request_id}` to fetch completed results.
-It does not exist in this version.
+```bash
+curl -X POST "http://localhost:8000/api/v1/analyze/path" \
+  -H "Content-Type: application/json" \
+  -d "{\"path\":\"C:/Users/kadir/Desktop/autoforge\"}"
+```
+
+Example response:
+
+```json
+{
+  "request_id": "9f0d9d4a-7a9a-4e49-8fb7-8d4c2c8ab3f1",
+  "status": "completed",
+  "summary": {
+    "files_scanned": 12,
+    "issues_found": 5,
+    "risk_score": 68
+  },
+  "findings": [
+    {
+      "type": "Potential N+1 Query",
+      "severity": "HIGH",
+      "file": "backend/users.py",
+      "line": 42,
+      "message": "Database-like call appears inside a loop.",
+      "impact": "This may increase latency significantly as data volume grows.",
+      "suggestion": "Batch queries, prefetch related data, or move data access outside the loop."
+    }
+  ],
+  "limitations": [
+    "This is a heuristic rule-based analysis.",
+    "Results may include false positives.",
+    "The analyzer does not execute code or build a full AST-based semantic model."
+  ]
+}
+```
 
 ## Run locally
 
@@ -90,12 +124,31 @@ Response (`202`):
 
 Validation errors return `422` with a structured error payload.
 
+### `POST /api/v1/analyze/path`
+
+Request body:
+
+```json
+{
+  "path": "C:/Users/kadir/Desktop/autoforge",
+  "max_files": 300,
+  "max_file_size_kb": 512
+}
+```
+
+Behavior:
+- Accepts absolute local directory paths only
+- Recursively scans supported source files: `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.go`, `.rs`, `.java`
+- Ignores common junk directories (`.git`, `node_modules`, `dist`, `build`, etc.)
+- Skips oversized and non-UTF8 files
+- Returns heuristic findings and a capped risk score
+
 ## Limitations
 
-- No completed analysis retrieval yet
-- No persistence
-- No authentication or rate limits
-- Not production-ready for sensitive/private code
+- Heuristic scanner; not a full semantic or runtime analyzer
+- Can produce false positives and false negatives
+- Does not execute code
+- Local-only endpoint should not be internet-exposed
 
 ## Why this might be worth starring
 
@@ -106,7 +159,10 @@ If you like small, runnable backends with explicit scope and no fake demo layers
 ```text
 .
 ├── backend/
-│   └── main.py
+│   ├── analyzer.py
+│   ├── main.py
+│   ├── models.py
+│   └── scanner.py
 ├── docs/
 │   └── MVP_SCOPE.md
 ├── tests/
