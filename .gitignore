@@ -17,3 +17,5 @@ htmlcov/
 node_modules/
 dist/
 build/
+
+data/codeshield.db

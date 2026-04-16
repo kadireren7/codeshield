@@ -1,14 +1,23 @@
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, Request, status
+from fastapi import BackgroundTasks, FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from fastapi import Response
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from backend.analyzer import analyze_codebase
+from backend.analysis_service import run_path_analysis
+from backend.db import init_db
+from backend.html_report import render_html_report
+from backend.job_runner import run_background_analysis
+from backend.jobs import create_job, get_job
 from backend.models import (
     AnalyzeAcceptedResponse,
+    AsyncJobAcceptedResponse,
+    AnalysisJobPollResponse,
     CodeAnalysisRequest,
     ErrorResponse,
     HealthResponse,
@@ -16,20 +25,8 @@ from backend.models import (
     PathAnalysisRequest,
     PathAnalysisResponse,
 )
-from backend.scanner import scan_source_files
-
-LOCAL_ANALYZER_LIMITATIONS = [
-    "This is a heuristic rule-based analysis.",
-    "Results may include false positives.",
-    "The analyzer does not execute code or build a full AST-based semantic model.",
-]
-
-
-def _is_local_absolute_path(path_value: str) -> bool:
-    if path_value.startswith("\\\\"):
-        return False
-    path = Path(path_value)
-    return path.is_absolute()
+from backend.rules_config import load_rules_config
+from backend.sarif_export import path_response_to_sarif
 
 
 def _error_response(status_code: int, message: str) -> JSONResponse:
@@ -37,10 +34,40 @@ def _error_response(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=payload.model_dump())
 
 
+def _validate_path_analysis_request(request: PathAnalysisRequest) -> JSONResponse | None:
+    if not Path(request.path).is_absolute() or request.path.startswith("\\\\"):
+        return _error_response(
+            status.HTTP_400_BAD_REQUEST,
+            "Path must be an absolute local filesystem path.",
+        )
+    if request.rules_config_path:
+        try:
+            load_rules_config(Path(request.rules_config_path))
+        except FileNotFoundError:
+            return _error_response(
+                status.HTTP_400_BAD_REQUEST,
+                f"Rules config not found: {request.rules_config_path}",
+            )
+    target = Path(request.path)
+    if not target.exists():
+        return _error_response(status.HTTP_404_NOT_FOUND, "Path does not exist.")
+    if not target.is_dir():
+        return _error_response(status.HTTP_400_BAD_REQUEST, "Path must point to a directory.")
+    return None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _ = app
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="CodeShield AI API",
     version="0.1.0",
     description="Experimental API with local rule-based project path analysis.",
+    lifespan=lifespan,
 )
 
 
@@ -75,7 +102,14 @@ async def meta() -> MetaResponse:
         version=app.version,
         api_version="v1",
         mode="experimental-mvp",
-        capabilities=["request_intake", "local_path_analyzer"],
+        capabilities=[
+            "request_intake",
+            "local_path_analyzer",
+            "python_ast_assist",
+            "async_path_jobs",
+            "sarif_export",
+            "html_report",
+        ],
         limits={
             "min_code_chars": 10,
             "max_code_chars": 100_000,
@@ -116,7 +150,6 @@ async def validation_exception_handler(
 )
 async def analyze_code(request: CodeAnalysisRequest) -> AnalyzeAcceptedResponse:
     _ = request
-    # MVP behavior: request intake only. No persisted result polling endpoint yet.
     return AnalyzeAcceptedResponse(
         request_id=uuid4(),
         status="pending",
@@ -137,40 +170,106 @@ async def analyze_code(request: CodeAnalysisRequest) -> AnalyzeAcceptedResponse:
     },
 )
 async def analyze_local_path(request: PathAnalysisRequest) -> PathAnalysisResponse | Response:
-    # Kept as a dedicated endpoint to preserve the existing intake contract and avoid
-    # overloading one route with two unrelated request shapes.
-    if not _is_local_absolute_path(request.path):
-        return _error_response(
-            status.HTTP_400_BAD_REQUEST,
-            "Path must be an absolute local filesystem path.",
-        )
-
-    target = Path(request.path)
-    if not target.exists():
-        return _error_response(status.HTTP_404_NOT_FOUND, "Path does not exist.")
-    if not target.is_dir():
-        return _error_response(status.HTTP_400_BAD_REQUEST, "Path must point to a directory.")
-
+    # Dedicated endpoint (vs extending POST /analyze) keeps unrelated contracts separate.
+    bad = _validate_path_analysis_request(request)
+    if bad is not None:
+        return bad
     try:
-        source_files = scan_source_files(
-            root=target,
-            max_files=request.max_files,
-            max_file_size_kb=request.max_file_size_kb,
-        )
-    except PermissionError:
-        return _error_response(status.HTTP_400_BAD_REQUEST, "Path is not readable.")
-    except OSError:
+        return run_path_analysis(request)
+    except (PermissionError, OSError):
         return _error_response(status.HTTP_400_BAD_REQUEST, "Path could not be scanned.")
 
-    result = analyze_codebase(source_files)
-    return PathAnalysisResponse(
-        request_id=uuid4(),
-        status="completed",
-        summary={
-            "files_scanned": len(source_files),
-            "issues_found": len(result.findings),
-            "risk_score": result.risk_score,
-        },
-        findings=result.findings,
-        limitations=LOCAL_ANALYZER_LIMITATIONS,
+
+@app.post(
+    "/api/v1/analyze/path/async",
+    response_model=AsyncJobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["analysis"],
+    summary="Queue local path analysis (poll GET /api/v1/analysis/{request_id})",
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid path input"},
+        404: {"model": ErrorResponse, "description": "Path not found"},
+    },
+)
+async def analyze_local_path_async(
+    request: PathAnalysisRequest,
+    background_tasks: BackgroundTasks,
+) -> AsyncJobAcceptedResponse | Response:
+    bad = _validate_path_analysis_request(request)
+    if bad is not None:
+        return bad
+    job_id = create_job(request)
+    background_tasks.add_task(run_background_analysis, job_id, request)
+    return AsyncJobAcceptedResponse(
+        request_id=job_id,
+        status="pending",
+        message="Job accepted. Poll GET /api/v1/analysis/{request_id} until status is completed or failed.",
     )
+
+
+@app.get(
+    "/api/v1/analysis/{request_id}",
+    response_model=AnalysisJobPollResponse,
+    tags=["analysis"],
+    summary="Poll async path analysis job",
+)
+async def poll_analysis_job(request_id: UUID) -> AnalysisJobPollResponse | Response:
+    row = get_job(request_id)
+    if row is None:
+        return _error_response(status.HTTP_404_NOT_FOUND, "Unknown analysis job id.")
+    if row["status"] == "pending":
+        return AnalysisJobPollResponse(request_id=request_id, status="pending")
+    if row["status"] == "failed":
+        return AnalysisJobPollResponse(
+            request_id=request_id,
+            status="failed",
+            error=row["error_message"] or "Job failed.",
+        )
+    data = json.loads(row["result_json"] or "{}")
+    completed = PathAnalysisResponse.model_validate(data)
+    return AnalysisJobPollResponse(
+        request_id=request_id,
+        status="completed",
+        summary=completed.summary,
+        findings=completed.findings,
+        limitations=completed.limitations,
+    )
+
+
+@app.get(
+    "/api/v1/analysis/{request_id}/sarif",
+    tags=["analysis"],
+    summary="SARIF 2.1.0 for completed async jobs",
+    response_model=None,
+)
+async def analysis_job_sarif(request_id: UUID) -> JSONResponse | Response:
+    row = get_job(request_id)
+    if row is None:
+        return _error_response(status.HTTP_404_NOT_FOUND, "Unknown analysis job id.")
+    if row["status"] != "completed" or not row["result_json"]:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "SARIF is only available for completed async analysis jobs.",
+        )
+    completed = PathAnalysisResponse.model_validate(json.loads(row["result_json"]))
+    return JSONResponse(content=path_response_to_sarif(completed))
+
+
+@app.get(
+    "/api/v1/analysis/{request_id}/report.html",
+    tags=["analysis"],
+    summary="HTML report for completed async jobs",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def analysis_job_html(request_id: UUID) -> HTMLResponse | Response:
+    row = get_job(request_id)
+    if row is None:
+        return _error_response(status.HTTP_404_NOT_FOUND, "Unknown analysis job id.")
+    if row["status"] != "completed" or not row["result_json"]:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "HTML report is only available for completed async analysis jobs.",
+        )
+    completed = PathAnalysisResponse.model_validate(json.loads(row["result_json"]))
+    return HTMLResponse(content=render_html_report(completed))

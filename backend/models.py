@@ -68,6 +68,10 @@ class PathAnalysisRequest(BaseModel):
     path: str = Field(..., min_length=1, description="Absolute local project directory path.")
     max_files: int = Field(default=300, ge=1, le=2_000)
     max_file_size_kb: int = Field(default=512, ge=32, le=5_120)
+    rules_config_path: str | None = Field(
+        default=None,
+        description="Optional absolute path to a YAML rules file overriding defaults.",
+    )
 
 
 class Finding(BaseModel):
@@ -92,3 +96,18 @@ class PathAnalysisResponse(BaseModel):
     summary: AnalysisSummary
     findings: list[Finding]
     limitations: list[str]
+
+
+class AsyncJobAcceptedResponse(BaseModel):
+    request_id: UUID
+    status: Literal["pending"]
+    message: str
+
+
+class AnalysisJobPollResponse(BaseModel):
+    request_id: UUID
+    status: Literal["pending", "completed", "failed"]
+    summary: AnalysisSummary | None = None
+    findings: list[Finding] | None = None
+    limitations: list[str] | None = None
+    error: str | None = None

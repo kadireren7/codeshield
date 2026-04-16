@@ -58,8 +58,10 @@ def test_meta() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["mode"] == "experimental-mvp"
-    assert "request_intake" in body["capabilities"]
-    assert "local_path_analyzer" in body["capabilities"]
+    caps = body["capabilities"]
+    assert "request_intake" in caps
+    assert "local_path_analyzer" in caps
+    assert "async_path_jobs" in caps
 
 
 def test_analyze_path_valid_small_project(tmp_path) -> None:
@@ -77,7 +79,7 @@ def test_analyze_path_valid_small_project(tmp_path) -> None:
     assert body["status"] == "completed"
     assert body["summary"]["files_scanned"] == 1
     assert isinstance(body["summary"]["risk_score"], int)
-    assert "heuristic rule-based analysis" in body["limitations"][0]
+    assert "heuristic" in body["limitations"][0].lower()
 
 
 def test_analyze_path_missing_path_field() -> None:
@@ -147,3 +149,34 @@ def test_analyze_path_finds_deliberate_risks(tmp_path) -> None:
     assert "Potential Memory Growth" in finding_types
     assert "Potential Performance Bottleneck" in finding_types
     assert "Missing Timeout" in finding_types
+
+
+def test_analyze_path_async_completes(tmp_path) -> None:
+    project_dir = tmp_path / "async_proj"
+    project_dir.mkdir()
+    (project_dir / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    response = client.post("/api/v1/analyze/path/async", json={"path": str(project_dir)})
+    assert response.status_code == 202
+    job_id = response.json()["request_id"]
+
+    poll = client.get(f"/api/v1/analysis/{job_id}")
+    assert poll.status_code == 200
+    body = poll.json()
+    assert body["status"] == "completed"
+    assert body["summary"]["files_scanned"] == 1
+
+
+def test_sarif_for_completed_async_job(tmp_path) -> None:
+    project_dir = tmp_path / "sarif_proj"
+    project_dir.mkdir()
+    (project_dir / "a.py").write_text("print(1)\n", encoding="utf-8")
+
+    response = client.post("/api/v1/analyze/path/async", json={"path": str(project_dir)})
+    job_id = response.json()["request_id"]
+
+    sarif = client.get(f"/api/v1/analysis/{job_id}/sarif")
+    assert sarif.status_code == 200
+    payload = sarif.json()
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["tool"]["driver"]["name"] == "CodeShield"

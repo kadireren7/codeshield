@@ -1,6 +1,6 @@
 # CodeShield AI
 
-Minimal FastAPI backend with a local rule-based project path analyzer.
+Minimal FastAPI backend with a **local experimental codebase risk scanner**: rule-based heuristics for many languages, plus **AST-assisted checks for Python** when the file parses.
 
 ## Why this exists
 
@@ -11,26 +11,26 @@ The goal is to build a real code-analysis backend in public, one verifiable step
 
 ## What it does today
 
-- Accepts analysis intake requests via `POST /api/v1/analyze`
-- Supports local project scanning via `POST /api/v1/analyze/path`
-- Scans local source files and returns likely production risk findings
-- Exposes health and API metadata endpoints:
-  - `GET /healthz`
-  - `GET /api/v1/meta`
+- Accepts analysis intake requests via `POST /api/v1/analyze` (stub intake; no result polling yet)
+- **Synchronous** local project scan: `POST /api/v1/analyze/path`
+- **Asynchronous** scan (SQLite-backed job, same machine): `POST /api/v1/analyze/path/async` → poll `GET /api/v1/analysis/{request_id}`
+- **CLI** using the same engine: `python -m backend.cli scan <ABS_PATH>`
+- Optional **YAML rules** file to enable/disable rules or override severities (`rules_config_path` in JSON, or `--rules` on CLI)
+- **SARIF 2.1.0** export for completed async jobs: `GET /api/v1/analysis/{request_id}/sarif`
+- **HTML report** for completed async jobs: `GET /api/v1/analysis/{request_id}/report.html`
+- Health and API metadata: `GET /healthz`, `GET /api/v1/meta`
 
 ## Local-only warning (important)
 
-`POST /api/v1/analyze/path` is for **local developer use only**.
+Path analysis endpoints are for **local developer use only**.
 
-- It reads filesystem paths on the same machine where this API runs.
-- It is **not safe for public internet exposure**.
-- Do not deploy this endpoint publicly without strict access controls and sandboxing.
+- They read filesystem paths on the same machine where this API runs.
+- They are **not safe for public internet exposure**.
+- Do not deploy them publicly without strict access controls and sandboxing.
 
 ## Demo
 
-This MVP supports intake and local path analysis.
-
-### 1) Submit code for analysis
+### 1) Submit code for analysis (intake stub)
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/analyze" \
@@ -38,17 +38,7 @@ curl -X POST "http://localhost:8000/api/v1/analyze" \
   -d "{\"code\":\"def get_total(items):\n    total = 0\n    for item in items:\n        total += item['price']\n    return total\",\"language\":\"python\"}"
 ```
 
-### 2) Current response (real)
-
-```json
-{
-  "request_id": "9f0d9d4a-7a9a-4e49-8fb7-8d4c2c8ab3f1",
-  "status": "pending",
-  "message": "Analysis request accepted. Result retrieval is not implemented in this MVP."
-}
-```
-
-### 3) Analyze a local project path
+### 2) Analyze a local project path (synchronous)
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/analyze/path" \
@@ -79,10 +69,54 @@ Example response:
     }
   ],
   "limitations": [
-    "This is a heuristic rule-based analysis.",
+    "This is a heuristic rule-based analysis; Python also uses AST-assisted checks where syntax is valid.",
     "Results may include false positives.",
-    "The analyzer does not execute code or build a full AST-based semantic model."
+    "The analyzer does not execute code or build a full semantic model for non-Python languages."
   ]
+}
+```
+
+### 3) Async job + SARIF / HTML (large or slow scans)
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/analyze/path/async" \
+  -H "Content-Type: application/json" \
+  -d "{\"path\":\"C:/Users/kadir/Desktop/autoforge\"}"
+```
+
+Poll until `status` is `completed` or `failed`:
+
+```bash
+curl "http://localhost:8000/api/v1/analysis/<REQUEST_ID>"
+```
+
+SARIF (completed jobs only):
+
+```bash
+curl "http://localhost:8000/api/v1/analysis/<REQUEST_ID>/sarif"
+```
+
+HTML report:
+
+```bash
+curl "http://localhost:8000/api/v1/analysis/<REQUEST_ID>/report.html" -o report.html
+```
+
+### 4) CLI (no HTTP server)
+
+```bash
+python -m backend.cli scan C:/Users/kadir/Desktop/CodeShield --json
+python -m backend.cli scan C:/Users/kadir/Desktop/CodeShield --sarif out.sarif.json --html report.html
+```
+
+### 5) Rule overrides (YAML)
+
+Copy `backend/config/default_rules.yaml`, edit `enabled` / optional `severity`, then pass the absolute path:
+
+```json
+{
+  "path": "C:/Users/kadir/Desktop/autoforge",
+  "rules_config_path": "C:/Users/kadir/Desktop/CodeShield/my_rules.yaml"
 }
 ```
 
@@ -96,33 +130,21 @@ pip install -r requirements-dev.txt
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open:
-- `http://localhost:8000/docs`
+Open `http://localhost:8000/docs`.
+
+### Job database location
+
+Async jobs are stored in SQLite. Default file: `data/codeshield.db` under the current working directory. Override with:
+
+`CODESHIELD_DB_PATH=/path/to/codeshield.db`
 
 ## API contract (current)
 
 ### `POST /api/v1/analyze`
 
-Request body:
+Request body: `code` (10..100000 chars), `language` enum.
 
-```json
-{
-  "code": "string, 10..100000 chars",
-  "language": "python | javascript | typescript | go | rust | java | cpp | csharp"
-}
-```
-
-Response (`202`):
-
-```json
-{
-  "request_id": "uuid",
-  "status": "pending",
-  "message": "Analysis request accepted. Result retrieval is not implemented in this MVP."
-}
-```
-
-Validation errors return `422` with a structured error payload.
+Response `202` with `pending` (intake only; no retrieval yet).
 
 ### `POST /api/v1/analyze/path`
 
@@ -132,23 +154,32 @@ Request body:
 {
   "path": "C:/Users/kadir/Desktop/autoforge",
   "max_files": 300,
-  "max_file_size_kb": 512
+  "max_file_size_kb": 512,
+  "rules_config_path": null
 }
 ```
 
-Behavior:
-- Accepts absolute local directory paths only
-- Recursively scans supported source files: `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.go`, `.rs`, `.java`
-- Ignores common junk directories (`.git`, `node_modules`, `dist`, `build`, etc.)
-- Skips oversized and non-UTF8 files
-- Returns heuristic findings and a capped risk score
+Response `200` with `completed` and findings.
+
+### `POST /api/v1/analyze/path/async`
+
+Same body as above. Response `202` with `request_id` and `pending`. Poll `GET /api/v1/analysis/{request_id}`.
+
+### `GET /api/v1/analysis/{request_id}`
+
+Returns `pending`, `completed` (summary + findings + limitations), or `failed` (error message).
 
 ## Limitations
 
-- Heuristic scanner; not a full semantic or runtime analyzer
+- Rule-based and heuristic; **not** a full semantic or runtime analyzer for all languages
+- Python: AST helps when syntax is valid; invalid files fall back to line heuristics only
 - Can produce false positives and false negatives
-- Does not execute code
-- Local-only endpoint should not be internet-exposed
+- Does not execute project code
+- Path endpoints must not be internet-exposed
+
+## CI
+
+GitHub Actions workflow (`.github/workflows/codeshield.yml`) installs dependencies and runs `pytest`.
 
 ## Why this might be worth starring
 
@@ -159,16 +190,30 @@ If you like small, runnable backends with explicit scope and no fake demo layers
 ```text
 .
 ├── backend/
+│   ├── analysis_service.py
 │   ├── analyzer.py
+│   ├── cli.py
+│   ├── config/
+│   │   └── default_rules.yaml
+│   ├── db.py
+│   ├── heuristic_analyzer.py
+│   ├── html_report.py
+│   ├── job_runner.py
+│   ├── jobs.py
 │   ├── main.py
 │   ├── models.py
+│   ├── python_ast_analyzer.py
+│   ├── rules_config.py
+│   ├── sarif_export.py
 │   └── scanner.py
 ├── docs/
-│   └── MVP_SCOPE.md
 ├── tests/
+│   ├── conftest.py
 │   └── test_api.py
 ├── .github/
-│   └── ISSUE_TEMPLATE/
+│   ├── ISSUE_TEMPLATE/
+│   └── workflows/
+│       └── codeshield.yml
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── Makefile
